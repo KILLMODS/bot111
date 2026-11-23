@@ -120,7 +120,7 @@ BOT_NAME = "KrakazeSkamBase"
 BOT_USERNAME = "@KrakazeBaseApp"
 BOT_URL = "https://t.me/KrakazeBaseApp"
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9065482185:AAGw1Ta4JVgqj9gunQSAjVrfwfxl4gMyZik")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9065482185:AAE7o3NiwXLuod3ocvO7_ymxKxvZ5cEpAtQk")
 ADMIN_IDS: List[int] = [7459502130, 684535319]  # Главные администраторы (полные права)
 ADMIN_IDS_SET = set(ADMIN_IDS)
 
