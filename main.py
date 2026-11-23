@@ -121,8 +121,12 @@ BOT_USERNAME = "@KrakazeBaseApp"
 BOT_URL = "https://t.me/KrakazeBaseApp"
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9065482185:AAGw1Ta4JVgqj9gunQSAjVrfwfxl4gMyZik")
-ADMIN_IDS: List[int] = [7459502130, 384810182]  # Главные администраторы (полные права)
+ADMIN_IDS: List[int] = [7459502130, 684535319]  # Главные администраторы (полные права)
 ADMIN_IDS_SET = set(ADMIN_IDS)
+
+# Опциональные Telegram API ID / Hash для глобального MTProto-определителя ID (my.telegram.org)
+TG_API_ID = int(os.environ.get("TG_API_ID") or os.environ.get("API_ID") or "0")
+TG_API_HASH = (os.environ.get("TG_API_HASH") or os.environ.get("API_HASH") or "").strip()
 
 REPORT_ROTATION_SECONDS = 3600  # 1 час на рассмотрение заявки одним модератором/админом
 MAX_REPORT_MEDIA = 20
@@ -1994,6 +1998,46 @@ def init_db() -> None:
                 accepted_at TEXT NOT NULL
             )
         """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_started_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT DEFAULT '',
+                full_name TEXT DEFAULT '',
+                started_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_started_users (user_id, username, full_name, started_at)
+            SELECT ua.user_id,
+                   COALESCE(uc.username, ''),
+                   COALESCE(uc.full_name, ''),
+                   ua.accepted_at
+            FROM user_agreements ua
+            LEFT JOIN users_cache uc ON uc.user_id = ua.user_id
+        """)
+
+        # Восстанавливаем недостающие user_id из текста пруфов/жалоб и users_cache
+        for tbl in ("scammers", "guarantors"):
+            extra_cols = ", reason, proof, proof_url" if tbl == "scammers" else ""
+            null_rows = conn.execute(
+                f"SELECT id, username, extra_usernames{extra_cols} FROM {tbl} WHERE user_id IS NULL"
+            ).fetchall()
+            for nr in null_rows:
+                cand_uid: Optional[int] = None
+                un_low = (nr["username"] or "").strip().lstrip("@").lower()
+                if un_low:
+                    uc_r = conn.execute("SELECT user_id FROM users_cache WHERE LOWER(username)=?", (un_low,)).fetchone()
+                    if uc_r and uc_r["user_id"]:
+                        cand_uid = int(uc_r["user_id"])
+                if not cand_uid and tbl == "scammers":
+                    txt_pool = f"{nr['proof'] or ''}\n{nr['reason'] or ''}\n{nr['proof_url'] or ''}"
+                    cand_uid = _extract_uid_from_text(txt_pool)
+                if cand_uid:
+                    taken = conn.execute(f"SELECT id FROM {tbl} WHERE user_id=?", (cand_uid,)).fetchone()
+                    if not taken:
+                        conn.execute(f"UPDATE {tbl} SET user_id=? WHERE id=?", (cand_uid, int(nr["id"])))
+
         conn.commit()
 
 
@@ -2721,6 +2765,33 @@ def db_log_check(checker_id: int, query_text: str, result_type: str) -> None:
         conn.commit()
 
 
+def db_record_started_user(user_id: Optional[int], username: str = "", full_name: str = "") -> None:
+    if not user_id or int(user_id) <= 0:
+        return
+    uid = int(user_id)
+    uname_clean = (username or "").strip().lstrip("@").lower()
+    name_clean = (full_name or "").strip()
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    with db_connect(write=True) as conn:
+        existing = conn.execute(
+            "SELECT username, full_name FROM bot_started_users WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+        if existing:
+            if existing["username"] == uname_clean and existing["full_name"] == name_clean:
+                return
+            conn.execute(
+                "UPDATE bot_started_users SET username=?, full_name=? WHERE user_id=?",
+                (uname_clean, name_clean, uid),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO bot_started_users (user_id, username, full_name, started_at) VALUES (?, ?, ?, ?)",
+                (uid, uname_clean, name_clean, now_str),
+            )
+        conn.commit()
+
+
 def db_get_stats() -> dict:
     with db_connect(write=False) as conn:
         total_scammers = int(conn.execute("SELECT COUNT(*) FROM scammers").fetchone()[0])
@@ -2731,6 +2802,7 @@ def db_get_stats() -> dict:
         pending_reports = int(conn.execute("SELECT COUNT(*) FROM scam_reports WHERE status='pending'").fetchone()[0])
         total_mods = int(conn.execute("SELECT COUNT(*) FROM moderators").fetchone()[0])
         total_agreed = int(conn.execute("SELECT COUNT(*) FROM user_agreements").fetchone()[0])
+        total_started = int(conn.execute("SELECT COUNT(*) FROM bot_started_users").fetchone()[0])
     return {
         "total_scammers": total_scammers,
         "total_guarantors": total_guarantors,
@@ -2740,7 +2812,177 @@ def db_get_stats() -> dict:
         "pending_reports": pending_reports,
         "total_mods": total_mods,
         "total_agreed": total_agreed,
+        "total_started": max(total_started, total_agreed),
     }
+
+
+_MTPROTO_LOCK = asyncio.Lock()
+_MTPROTO_CLIENT: Any = None
+_MTPROTO_CREDS: Optional[Tuple[int, str]] = None
+_ADMIN_SCAN_TS: Dict[int, float] = {}
+
+
+def _get_mtproto_credentials() -> Tuple[int, str]:
+    api_id = TG_API_ID
+    api_hash = TG_API_HASH
+    if not api_id or not api_hash:
+        try:
+            raw_id = db_get_setting("mtproto_api_id", "").strip()
+            raw_hash = db_get_setting("mtproto_api_hash", "").strip()
+            if raw_id.isdigit() and raw_hash:
+                api_id = int(raw_id)
+                api_hash = raw_hash
+        except Exception:
+            pass
+    return api_id, api_hash
+
+
+def db_set_mtproto_credentials(api_id: Optional[int], api_hash: str = "") -> None:
+    global _MTPROTO_CLIENT, _MTPROTO_CREDS
+    if not api_id or not api_hash:
+        db_set_setting("mtproto_api_id", "")
+        db_set_setting("mtproto_api_hash", "")
+    else:
+        db_set_setting("mtproto_api_id", str(int(api_id)))
+        db_set_setting("mtproto_api_hash", api_hash.strip())
+    _MTPROTO_CLIENT = None
+    _MTPROTO_CREDS = None
+
+
+def _is_mtproto_ready() -> Tuple[bool, str]:
+    api_id, api_hash = _get_mtproto_credentials()
+    if not api_id or not api_hash:
+        return False, "нет API_ID/API_HASH"
+    try:
+        import telethon  # noqa: F401
+        return True, "Telethon подключён"
+    except ImportError:
+        try:
+            import pyrogram  # noqa: F401
+            return True, "Pyrogram подключён"
+        except ImportError:
+            return False, "нужен telethon или pyrogram"
+
+
+async def resolve_username_via_mtproto(username: str) -> Optional[Tuple[str, Optional[int], str, str]]:
+    """
+    Глобально определяет ID пользователя по @username через MTProto (даже если он не заходил в бот),
+    если заданы TG_API_ID / TG_API_HASH (через окружение или /set_api) и установлен telethon/pyrogram.
+    Возвращает ("USER", uid, uname, full_name) | ("CHAT", None, "", "") | None.
+    """
+    global _MTPROTO_CLIENT, _MTPROTO_CREDS
+    uname = (username or "").strip().lstrip("@").lower()
+    if not uname:
+        return None
+    api_id, api_hash = _get_mtproto_credentials()
+    if not api_id or not api_hash:
+        return None
+
+    async with _MTPROTO_LOCK:
+        # 1. Пробуем Telethon
+        try:
+            from telethon import TelegramClient
+            from telethon.sessions import MemorySession
+            from telethon.tl.types import Channel, Chat, User
+
+            if _MTPROTO_CLIENT is None or _MTPROTO_CREDS != (api_id, api_hash):
+                if _MTPROTO_CLIENT is not None:
+                    try:
+                        await _MTPROTO_CLIENT.disconnect()
+                    except Exception:
+                        pass
+                client = TelegramClient(MemorySession(), api_id, api_hash)
+                await client.start(bot_token=BOT_TOKEN)
+                _MTPROTO_CLIENT = client
+                _MTPROTO_CREDS = (api_id, api_hash)
+
+            if not _MTPROTO_CLIENT.is_connected():
+                await _MTPROTO_CLIENT.connect()
+
+            entity = await _MTPROTO_CLIENT.get_entity(uname)
+            if isinstance(entity, (Channel, Chat)):
+                return ("CHAT", None, "", "")
+            if isinstance(entity, User):
+                if getattr(entity, "bot", False):
+                    return ("BOT", None, "", "")
+                uid = int(entity.id)
+                u_un = (getattr(entity, "username", None) or uname).strip().lstrip("@").lower()
+                u_name = " ".join(
+                    p for p in (getattr(entity, "first_name", None), getattr(entity, "last_name", None)) if p
+                ).strip()
+                db_upsert_user_cache(user_id=uid, username=u_un, full_name=u_name)
+                return ("USER", uid, u_un, u_name)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug("MTProto Telethon resolve(@%s): %s", uname, e)
+
+        # 2. Фолбэк на Pyrogram
+        try:
+            from pyrogram import Client as PyroClient
+            from pyrogram.enums import ChatType as PyroChatType
+
+            async with PyroClient(
+                "krakaze_mtproto_mem",
+                api_id=api_id,
+                api_hash=api_hash,
+                bot_token=BOT_TOKEN,
+                in_memory=True,
+                no_updates=True,
+            ) as app:
+                info = await app.get_chat(uname)
+                ctype = getattr(info, "type", None)
+                if ctype in (PyroChatType.GROUP, PyroChatType.SUPERGROUP, PyroChatType.CHANNEL):
+                    return ("CHAT", None, "", "")
+                if getattr(info, "is_bot", False):
+                    return ("BOT", None, "", "")
+                uid = int(info.id)
+                if uid > 0:
+                    u_un = (getattr(info, "username", None) or uname).strip().lstrip("@").lower()
+                    u_name = " ".join(
+                        p for p in (getattr(info, "first_name", None), getattr(info, "last_name", None)) if p
+                    ).strip()
+                    db_upsert_user_cache(user_id=uid, username=u_un, full_name=u_name)
+                    return ("USER", uid, u_un, u_name)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug("MTProto Pyrogram resolve(@%s): %s", uname, e)
+
+    return None
+
+
+async def _cache_chat_admins_if_needed(bot, target_uname: str = "", max_chats: int = 5) -> None:
+    """Кэширует администраторов общих групп/каналов через Bot API get_chat_administrators (TTL 10 мин)."""
+    proof_ch_id, _, _ = db_get_proof_channel()
+    cids: List[int] = []
+    if proof_ch_id:
+        cids.append(int(proof_ch_id))
+    for c in _get_known_chat_ids():
+        if c not in cids:
+            cids.append(c)
+
+    now = time.time()
+    uname_low = (target_uname or "").strip().lstrip("@").lower()
+    scanned = 0
+    for cid in cids:
+        if scanned >= max_chats:
+            break
+        last_ts = _ADMIN_SCAN_TS.get(cid, 0.0)
+        if now - last_ts < 600.0:
+            continue
+        _ADMIN_SCAN_TS[cid] = now
+        scanned += 1
+        try:
+            admins = await bot.get_chat_administrators(cid)
+            for cm in admins:
+                u = getattr(cm, "user", None)
+                if u and not getattr(u, "is_bot", False):
+                    _cache_tg_user_obj(u)
+                    if uname_low and (getattr(u, "username", None) or "").strip().lstrip("@").lower() == uname_low:
+                        return
+        except Exception as e:
+            logger.debug("get_chat_administrators(%s): %s", cid, e)
 
 
 # =====================================================================
@@ -3499,7 +3741,10 @@ def _cache_tg_user_obj(u) -> None:
     db_upsert_user_cache(user_id=int(uid), username=uname, full_name=fname)
 
 
-def extract_target_from_message(message) -> Tuple[Optional[int], str, str, Optional[str]]:
+def extract_target_from_message(
+    message,
+    override_text: Optional[str] = None,
+) -> Tuple[Optional[int], str, str, Optional[str]]:
     """
     Извлекает (user_id, username, full_name, rejection_error).
     Поддерживает users_shared / user_shared (кнопка «Выбрать пользователя»),
@@ -3509,55 +3754,59 @@ def extract_target_from_message(message) -> Tuple[Optional[int], str, str, Optio
     if getattr(message, "reply_to_message", None) and getattr(message.reply_to_message, "from_user", None):
         _cache_tg_user_obj(message.reply_to_message.from_user)
 
-    users_shared = getattr(message, "users_shared", None)
-    if users_shared:
-        shared_list = list(getattr(users_shared, "users", None) or [])
-        if shared_list:
-            su = shared_list[0]
-            su_id = getattr(su, "user_id", None)
-            if su_id:
-                su_uname = (getattr(su, "username", None) or "").strip().lstrip("@").lower()
-                su_name = " ".join(
-                    p for p in (getattr(su, "first_name", None), getattr(su, "last_name", None)) if p
-                ).strip()
-                db_upsert_user_cache(user_id=int(su_id), username=su_uname, full_name=su_name)
-                return int(su_id), su_uname, su_name, None
+    if override_text is None:
+        users_shared = getattr(message, "users_shared", None)
+        if users_shared:
+            shared_list = list(getattr(users_shared, "users", None) or [])
+            if shared_list:
+                su = shared_list[0]
+                su_id = getattr(su, "user_id", None)
+                if su_id:
+                    su_uname = (getattr(su, "username", None) or "").strip().lstrip("@").lower()
+                    su_name = " ".join(
+                        p for p in (getattr(su, "first_name", None), getattr(su, "last_name", None)) if p
+                    ).strip()
+                    db_upsert_user_cache(user_id=int(su_id), username=su_uname, full_name=su_name)
+                    return int(su_id), su_uname, su_name, None
 
-    user_shared = getattr(message, "user_shared", None)
-    if user_shared and getattr(user_shared, "user_id", None):
-        su_id = int(user_shared.user_id)
-        db_upsert_user_cache(user_id=su_id)
-        return su_id, "", "", None
+        user_shared = getattr(message, "user_shared", None)
+        if user_shared and getattr(user_shared, "user_id", None):
+            su_id = int(user_shared.user_id)
+            db_upsert_user_cache(user_id=su_id)
+            return su_id, "", "", None
 
-    fwd_origin = getattr(message, "forward_origin", None)
-    origin_type = getattr(fwd_origin, "type", "") if fwd_origin else ""
-    if origin_type in ("channel", "chat"):
-        return None, "", "", "Группы и каналы не проверяются! Укажите личный аккаунт пользователя."
+        fwd_origin = getattr(message, "forward_origin", None)
+        origin_type = getattr(fwd_origin, "type", "") if fwd_origin else ""
+        if origin_type in ("channel", "chat"):
+            return None, "", "", "Группы и каналы не проверяются! Укажите личный аккаунт пользователя."
 
-    if getattr(message, "forward_from_chat", None):
-        return None, "", "", "Группы и каналы не проверяются! Укажите личный аккаунт пользователя."
+        if getattr(message, "forward_from_chat", None):
+            return None, "", "", "Группы и каналы не проверяются! Укажите личный аккаунт пользователя."
 
-    fwd_from = getattr(message, "forward_from", None)
-    if not fwd_from and fwd_origin:
-        fwd_from = getattr(fwd_origin, "sender_user", None)
+        fwd_from = getattr(message, "forward_from", None)
+        if not fwd_from and fwd_origin:
+            fwd_from = getattr(fwd_origin, "sender_user", None)
 
-    if fwd_from:
-        if getattr(fwd_from, "is_bot", False):
-            return None, "", "", "Боты не проверяются! Укажите аккаунт реального пользователя."
-        fwd_name = " ".join(p for p in (fwd_from.first_name, fwd_from.last_name) if p).strip()
-        db_upsert_user_cache(
-            user_id=fwd_from.id,
-            username=fwd_from.username or "",
-            full_name=fwd_name,
-        )
-        return fwd_from.id, (fwd_from.username or "").lower(), fwd_name, None
+        if fwd_from:
+            if getattr(fwd_from, "is_bot", False):
+                return None, "", "", "Боты не проверяются! Укажите аккаунт реального пользователя."
+            fwd_name = " ".join(p for p in (fwd_from.first_name, fwd_from.last_name) if p).strip()
+            db_upsert_user_cache(
+                user_id=fwd_from.id,
+                username=fwd_from.username or "",
+                full_name=fwd_name,
+            )
+            return fwd_from.id, (fwd_from.username or "").lower(), fwd_name, None
 
-    # Поддержка пересланного/отправленного контакта Telegram
-    contact = getattr(message, "contact", None)
-    if contact and getattr(contact, "user_id", None):
-        c_name = " ".join(p for p in (contact.first_name, contact.last_name) if p).strip()
-        db_upsert_user_cache(user_id=contact.user_id, full_name=c_name)
-        return int(contact.user_id), "", c_name, None
+        # Поддержка пересланного/отправленного контакта Telegram
+        contact = getattr(message, "contact", None)
+        if contact and getattr(contact, "user_id", None):
+            c_name = " ".join(p for p in (contact.first_name, contact.last_name) if p).strip()
+            db_upsert_user_cache(user_id=contact.user_id, full_name=c_name)
+            return int(contact.user_id), "", c_name, None
+    else:
+        fwd_origin = None
+        origin_type = ""
 
     entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []
     for ent in entities:
@@ -3577,10 +3826,13 @@ def extract_target_from_message(message) -> Tuple[Optional[int], str, str, Optio
             if l_id or l_un:
                 return l_id, l_un, "", None
 
-    raw_text = (message.text or message.caption or "").strip()
-    if raw_text.lower().startswith("/check"):
-        parts = raw_text.split(maxsplit=1)
-        raw_text = parts[1].strip() if len(parts) > 1 else ""
+    if override_text is not None:
+        raw_text = override_text.strip()
+    else:
+        raw_text = (message.text or message.caption or "").strip()
+        if raw_text.lower().startswith("/check"):
+            parts = raw_text.split(maxsplit=1)
+            raw_text = parts[1].strip() if len(parts) > 1 else ""
 
     if re.search(r"t\.me/(?:\+|joinchat/|c/\d+)", raw_text, re.IGNORECASE):
         return None, "", "", "Ссылки на группы и каналы не проверяются! Укажите личный аккаунт пользователя."
@@ -3606,6 +3858,63 @@ def extract_target_from_message(message) -> Tuple[Optional[int], str, str, Optio
             f"Пользователь{who} скрыл свой профиль при пересылке сообщений. Отправьте его @username или числовой Telegram ID.",
         )
     return q_id, q_uname, "", None
+
+
+def _extract_reply_target_user(reply_msg) -> Tuple[Optional[int], str, str, Optional[str]]:
+    """Извлекает проверяемого пользователя из сообщения, на которое ответили командой «проверить» / «чек»."""
+    if not reply_msg:
+        return None, "", "", None
+    r_user = getattr(reply_msg, "from_user", None)
+    if r_user:
+        if getattr(r_user, "is_bot", False):
+            # Если ответили на пересланное ботом сообщение - пробуем достать автора оригинала
+            fwd_u = getattr(reply_msg, "forward_from", None)
+            if not fwd_u and getattr(reply_msg, "forward_origin", None):
+                fwd_u = getattr(reply_msg.forward_origin, "sender_user", None)
+            if fwd_u and not getattr(fwd_u, "is_bot", False):
+                fname = " ".join(p for p in (fwd_u.first_name, fwd_u.last_name) if p).strip()
+                _cache_tg_user_obj(fwd_u)
+                return int(fwd_u.id), (fwd_u.username or "").lower(), fname, None
+            return None, "", "", "Боты не проверяются! Укажите аккаунт реального пользователя."
+        fname = " ".join(p for p in (r_user.first_name, r_user.last_name) if p).strip()
+        _cache_tg_user_obj(r_user)
+        return int(r_user.id), (r_user.username or "").lower(), fname, None
+
+    if getattr(reply_msg, "sender_chat", None) or getattr(reply_msg, "forward_from_chat", None):
+        return None, "", "", "Группы и каналы не проверяются! Укажите личный аккаунт пользователя."
+    return extract_target_from_message(reply_msg)
+
+
+def _extract_group_check_command(msg_obj) -> Tuple[bool, Optional[int], str, str, str, Optional[str]]:
+    """
+    Распознаёт групповые команды:
+    - «проверить @username» / «чек 123456» / «проверить https://t.me/...»
+    - ответ (reply) на сообщение пользователя словами «проверить» / «чек»
+    """
+    raw_text = (getattr(msg_obj, "text", None) or getattr(msg_obj, "caption", None) or "").strip()
+    if not raw_text:
+        return False, None, "", "", "", None
+
+    bot_slug = re.escape(BOT_USERNAME.lstrip("@"))
+    m_cmd = re.match(
+        rf"^(?:[/!])?(?:проверить|чек|check)(?:@{bot_slug})?(?:\s+([\s\S]+))?$",
+        raw_text,
+        flags=re.IGNORECASE,
+    )
+    if not m_cmd:
+        return False, None, "", "", "", None
+
+    arg_part = (m_cmd.group(1) or "").strip()
+    if arg_part:
+        q_id, q_uname, fwd_name, val_err = extract_target_from_message(msg_obj, override_text=arg_part)
+        return True, q_id, q_uname, fwd_name, arg_part, val_err
+
+    reply_msg = getattr(msg_obj, "reply_to_message", None)
+    if reply_msg:
+        q_id, q_uname, fwd_name, val_err = _extract_reply_target_user(reply_msg)
+        return True, q_id, q_uname, fwd_name, str(q_id or q_uname or "reply"), val_err
+
+    return True, None, "", "", "", "__EMPTY_GROUP_CHECK__"
 
 
 def _inspect_public_tme_page(
@@ -3836,6 +4145,55 @@ async def validate_and_resolve_user(
         if post_uid:
             resolved_id = int(post_uid)
             verified_exists = True
+
+    # 2.7 Глобальное определение ID через MTProto (если заданы API_ID/API_HASH и telethon/pyrogram)
+    if not resolved_id and resolved_uname:
+        try:
+            mt_res = await asyncio.wait_for(
+                resolve_username_via_mtproto(resolved_uname),
+                timeout=2.4 if fetch_avatar else 1.6,
+            )
+            if mt_res:
+                mt_kind, mt_uid, mt_un, mt_name = mt_res
+                if mt_kind == "CHAT" and not in_scam and not in_guar:
+                    return (
+                        False,
+                        "Группы и каналы не проверяются! Укажите личный аккаунт пользователя.",
+                        None,
+                        "",
+                        [],
+                        "",
+                        None,
+                    )
+                if mt_kind == "BOT" and not in_scam and not in_guar:
+                    return (
+                        False,
+                        "Боты не проверяются! Укажите аккаунт реального пользователя.",
+                        None,
+                        "",
+                        [],
+                        "",
+                        None,
+                    )
+                if mt_kind == "USER" and mt_uid:
+                    resolved_id = int(mt_uid)
+                    verified_exists = True
+                    if mt_un:
+                        resolved_uname = mt_un
+                    if mt_name and (not resolved_name or _is_placeholder_name(resolved_name, resolved_uname, resolved_id)):
+                        resolved_name = mt_name
+        except Exception as e:
+            logger.debug("MTProto timeout/error for @%s: %s", resolved_uname, e)
+
+    # 2.8 Поиск среди администраторов известных групп/каналов (TTL 10 мин)
+    if not resolved_id and resolved_uname:
+        await _cache_chat_admins_if_needed(bot, resolved_uname, max_chats=(5 if fetch_avatar else 2))
+        adm_known = db_lookup_known_identity(username=resolved_uname)
+        if adm_known["user_id"]:
+            resolved_id = int(adm_known["user_id"])
+            verified_exists = True
+            if adm_known["full_name"] and (not resolved_name or _is_placeholder_name(resolved_name, resolved_uname, resolved_id)):
+                resolved_name = adm_known["full_name"]
 
     # 3. Резервный запрос через канал пруфов и известные чаты (get_chat_member работает по ID, если юзер там есть)
     if resolved_id and (not resolved_uname or not resolved_name or not got_private_chat):
@@ -4072,16 +4430,28 @@ def build_unverified_kb(
     dislikes: int,
     add_payload: str,
     is_admin: bool = False,
+    in_group: bool = False,
+    user_id: Optional[int] = None,
+    username: str = "",
 ) -> InlineKeyboardMarkup:
     rows = [
         [
             make_btn(f"Лайк ({likes})", callback_data=f"vote:like:{target_key}", style="success", emoji_key="check"),
             make_btn(f"Дизлайк ({dislikes})", callback_data=f"vote:dislike:{target_key}", style="danger", emoji_key="cross"),
         ],
-        [
-            make_btn("Подать жалобу", callback_data=f"report_prefill:{target_key}", style="danger", emoji_key="siren"),
-        ],
     ]
+    if in_group:
+        bot_slug = BOT_USERNAME.lstrip("@")
+        tok = _build_inline_start_token(user_id, username)
+        rows.append([
+            make_btn("Подать жалобу", url=f"https://t.me/{bot_slug}?start=rep_{tok}", style="danger", emoji_key="siren"),
+            make_btn("Открыть в боте", url=f"https://t.me/{bot_slug}?start=chk_{tok}", emoji_key="search"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    rows.append([
+        make_btn("Подать жалобу", callback_data=f"report_prefill:{target_key}", style="danger", emoji_key="siren"),
+    ])
     if is_admin:
         rows.append([
             make_btn("Занести в скам-базу", callback_data=f"scam_quick_add:{add_payload}", emoji_key="siren"),
@@ -4098,6 +4468,9 @@ def build_scammer_kb(
     proof_url: str = "",
     is_admin: bool = False,
     proof_media_count: int = 0,
+    in_group: bool = False,
+    user_id: Optional[int] = None,
+    username: str = "",
 ) -> InlineKeyboardMarkup:
     proof_row = []
     if proof_url:
@@ -4112,6 +4485,12 @@ def build_scammer_kb(
         )
 
     rows = [proof_row]
+    if in_group:
+        bot_slug = BOT_USERNAME.lstrip("@")
+        tok = _build_inline_start_token(user_id, username)
+        rows.append([make_btn("Открыть в боте", url=f"https://t.me/{bot_slug}?start=chk_{tok}", emoji_key="siren")])
+        return InlineKeyboardMarkup(rows)
+
     if is_admin:
         rows.append([
             make_btn("Удалить из базы", callback_data=f"scam_del_ask:{record_id}", style="danger", emoji_key="trash"),
@@ -4127,6 +4506,9 @@ def build_guarantor_kb(
     target_key: str = "",
     likes: int = 0,
     dislikes: int = 0,
+    in_group: bool = False,
+    user_id: Optional[int] = None,
+    username: str = "",
 ) -> InlineKeyboardMarkup:
     rows = []
     if target_key:
@@ -4134,6 +4516,15 @@ def build_guarantor_kb(
             make_btn(f"Лайк ({likes})", callback_data=f"vote:like:{target_key}", style="success", emoji_key="check"),
             make_btn(f"Дизлайк ({dislikes})", callback_data=f"vote:dislike:{target_key}", style="danger", emoji_key="cross"),
         ])
+    if in_group:
+        bot_slug = BOT_USERNAME.lstrip("@")
+        tok = _build_inline_start_token(user_id, username)
+        rows.append([
+            make_btn("Подать жалобу", url=f"https://t.me/{bot_slug}?start=rep_{tok}", style="danger", emoji_key="siren"),
+            make_btn("Открыть в боте", url=f"https://t.me/{bot_slug}?start=chk_{tok}", emoji_key="crown"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
     rows.append([
         make_btn(
             "Подать жалобу",
@@ -4369,6 +4760,7 @@ async def perform_scam_check_and_reply(
     fwd_name: str = "",
     raw_query: str = "",
     validation_error: Optional[str] = None,
+    in_group: bool = False,
 ) -> None:
     msg = update.effective_message
     checker = update.effective_user
@@ -4377,9 +4769,17 @@ async def perform_scam_check_and_reply(
 
     is_admin = is_full_admin(checker.id)
     was_search_mode = bool(
-        context.user_data.pop("_awaiting_user_search", False)
-        or getattr(msg, "users_shared", None)
-        or getattr(msg, "user_shared", None)
+        (not in_group)
+        and (
+            context.user_data.pop("_awaiting_user_search", False)
+            or getattr(msg, "users_shared", None)
+            or getattr(msg, "user_shared", None)
+        )
+    )
+    fallback_kb = (
+        InlineKeyboardMarkup([[make_btn("Открыть бота", url=BOT_URL, emoji_key="crown")]])
+        if in_group
+        else get_user_main_kb(checker.id)
     )
 
     if validation_error:
@@ -4389,11 +4789,22 @@ async def perform_scam_check_and_reply(
                 await tmp_rm.delete()
             except Exception:
                 pass
+        if validation_error == "__EMPTY_GROUP_CHECK__":
+            await safe_reply_text(
+                msg,
+                f"{EMOJI['search']} <b><u>Как проверить пользователя в группе</u></b>\n\n"
+                + quote_block(
+                    "• Напишите: <code>проверить @username</code> или <code>чек 123456789</code>\n"
+                    "• Либо <b>ответьте (reply)</b> на сообщение человека словом <code>проверить</code> или <code>чек</code>!"
+                ),
+                reply_markup=fallback_kb,
+            )
+            return
         await safe_reply_text(
             msg,
             f"{EMOJI['no_entry']} <b><u>Проверка отклонена</u></b>\n\n"
             + quote_block(f"{EMOJI['warn']} <i>{esc(validation_error)}</i>"),
-            reply_markup=get_user_main_kb(checker.id),
+            reply_markup=fallback_kb,
         )
         return
 
@@ -4412,9 +4823,9 @@ async def perform_scam_check_and_reply(
                 f"• <code>@username</code> <i>(например,</i> <code>@durov</code><i>)</i>\n"
                 f"• <b>Telegram ID</b> <i>(например,</i> <code>123456789</code><i>)</i>\n"
                 f"• Ссылку <code>t.me/username</code> или <code>tg://user?id=...</code>\n"
-                f"• <i>Перешлите сообщение или выберите контакт кнопкой ниже.</i>"
+                f"• <i>Перешлите сообщение или ответьте на сообщение командой</i> <code>проверить</code>."
             ),
-            reply_markup=get_user_main_kb(checker.id),
+            reply_markup=fallback_kb,
         )
         return
 
@@ -4460,7 +4871,7 @@ async def perform_scam_check_and_reply(
             msg,
             f"{EMOJI['no_entry']} <b><u>Проверка не выполнена</u></b>\n\n"
             + quote_block(f"{EMOJI['warn']} {val_err}"),
-            reply_markup=get_user_main_kb(checker.id),
+            reply_markup=fallback_kb,
         )
         return
 
@@ -4561,6 +4972,9 @@ async def perform_scam_check_and_reply(
             proof_url=proof_url,
             is_admin=is_admin,
             proof_media_count=media_cnt,
+            in_group=in_group,
+            user_id=final_id,
+            username=final_uname,
         )
 
     elif guar_row:
@@ -4613,6 +5027,9 @@ async def perform_scam_check_and_reply(
             target_key=target_key,
             likes=likes,
             dislikes=dislikes,
+            in_group=in_group,
+            user_id=final_id,
+            username=final_uname,
         )
 
     else:
@@ -4629,7 +5046,16 @@ async def perform_scam_check_and_reply(
         add_payload = f"{final_id or ''}|{final_uname[:24]}"
 
         caption = build_unverified_caption(final_name, final_uname, merged_extras, final_id, likes, dislikes)
-        kb = build_unverified_kb(target_key, likes, dislikes, add_payload, is_admin=is_admin)
+        kb = build_unverified_kb(
+            target_key,
+            likes,
+            dislikes,
+            add_payload,
+            is_admin=is_admin,
+            in_group=in_group,
+            user_id=final_id,
+            username=final_uname,
+        )
 
     if wait_msg:
         try:
@@ -5249,6 +5675,7 @@ async def start_or_menu_handler(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     full_name = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
     db_upsert_user_cache(user_id=user.id, username=user.username or "", full_name=full_name)
+    db_record_started_user(user_id=user.id, username=user.username or "", full_name=full_name)
     was_search = bool(context.user_data.pop("_awaiting_user_search", False))
     deep_arg = context.args[0].strip() if context.args else ""
     context.user_data.clear()
@@ -5292,13 +5719,14 @@ async def check_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
     full_name = " ".join(p for p in (user.first_name, user.last_name) if p).strip()
     db_upsert_user_cache(user_id=user.id, username=user.username or "", full_name=full_name)
 
-    if not db_has_accepted_terms(user.id):
+    is_priv = bool(update.effective_chat and update.effective_chat.type == ChatType.PRIVATE)
+    if is_priv and not db_has_accepted_terms(user.id):
         await send_welcome_terms_prompt(update.message, user.id, full_mode=False)
         return ConversationHandler.END
 
     if context.args:
-        q_id, q_uname, fwd_name, val_err = extract_target_from_message(update.message)
         raw_query = " ".join(context.args).strip()
+        q_id, q_uname, fwd_name, val_err = extract_target_from_message(update.message, override_text=raw_query)
         await perform_scam_check_and_reply(
             update,
             context,
@@ -5307,10 +5735,24 @@ async def check_command_handler(update: Update, context: ContextTypes.DEFAULT_TY
             fwd_name=fwd_name,
             raw_query=raw_query,
             validation_error=val_err,
+            in_group=not is_priv,
         )
         return ConversationHandler.END
 
-    is_priv = bool(update.effective_chat and update.effective_chat.type == ChatType.PRIVATE)
+    if getattr(update.message, "reply_to_message", None):
+        q_id, q_uname, fwd_name, val_err = _extract_reply_target_user(update.message.reply_to_message)
+        await perform_scam_check_and_reply(
+            update,
+            context,
+            q_id=q_id,
+            q_uname=q_uname,
+            fwd_name=fwd_name,
+            raw_query=str(q_id or q_uname or "reply"),
+            validation_error=val_err,
+            in_group=not is_priv,
+        )
+        return ConversationHandler.END
+
     await send_search_user_prompt(update.message, context, is_private=is_priv)
     return ConversationHandler.END
 
@@ -5333,6 +5775,97 @@ async def profile_command_handler(update: Update, context: ContextTypes.DEFAULT_
         q_uname=(user.username or "").lower(),
         fwd_name=full_name,
         raw_query=str(user.id),
+    )
+
+
+async def set_api_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_user or not update.effective_chat:
+        return
+    user = update.effective_user
+    if not is_full_admin(user.id):
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['cross']} Команда <code>/set_api</code> доступна только главным администраторам.",
+        )
+        return
+
+    args = list(context.args or [])
+    if not args:
+        mt_ok, mt_msg = _is_mtproto_ready()
+        api_id, api_hash = _get_mtproto_credentials()
+        masked_hash = f"{api_hash[:4]}...{api_hash[-4:]}" if len(api_hash) >= 10 else ("задан" if api_hash else "нет")
+        status_line = f"Активен ({mt_msg})" if mt_ok else f"Не готов ({mt_msg})"
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['lock']} <b><u>Настройка определителя ID (MTProto)</u></b>\n\n"
+            + quote_block(
+                f"<b>Статус:</b>  <code>{esc(status_line)}</code>\n"
+                f"<b>API_ID:</b>  <code>{api_id or 'нет'}</code>\n"
+                f"<b>API_HASH:</b>  <code>{esc(masked_hash)}</code>\n\n"
+                f"<i>Зачем это нужно: обычный Bot API не выдаёт Telegram ID незнакомых "
+                f"пользователей, если они не заходили в бота и не находятся в общих группах. "
+                f"После подключения MTProto (Telethon / Pyrogram) бот сможет находить ID любого "
+                f"@username глобально.</i>"
+            )
+            + "\n\n<b>Команды:</b>\n"
+            "• <code>/set_api API_ID API_HASH</code> (получить на my.telegram.org)\n"
+            "• <code>/set_api clear</code> - удалить сохранённые ключи",
+        )
+        return
+
+    if len(args) == 1 and args[0].strip().lower() in ("clear", "off", "reset", "delete", "удалить"):
+        db_set_mtproto_credentials(None)
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['check']} Ключи MTProto (<code>API_ID</code> / <code>API_HASH</code>) удалены из базы.",
+        )
+        return
+
+    if len(args) < 2:
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['warn']} Укажите оба параметра: <code>/set_api 12345678 abcdef1234567890abcdef1234567890</code>",
+        )
+        return
+
+    raw_id = args[0].strip()
+    raw_hash = args[1].strip()
+    if not raw_id.isdigit() or int(raw_id) <= 0:
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['cross']} Некорректный <code>API_ID</code>. Ожидается положительное число.",
+        )
+        return
+    if len(raw_hash) < 16 or any(ch.isspace() for ch in raw_hash):
+        await safe_reply_text(
+            update.message,
+            f"{EMOJI['cross']} Некорректный <code>API_HASH</code> (минимум 16 символов без пробелов).",
+        )
+        return
+
+    db_set_mtproto_credentials(int(raw_id), raw_hash)
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    mt_ok, mt_msg = _is_mtproto_ready()
+    extra_hint = (
+        "\n<i>Определитель ID готов к глобальному поиску по @username!</i>"
+        if mt_ok
+        else f"\n{EMOJI['warn']} <i>Ключи сохранены, но {esc(mt_msg)}. Установите пакет:</i> <code>pip install telethon</code>"
+    )
+    await safe_send_message(
+        context.bot,
+        chat_id=update.effective_chat.id,
+        text=(
+            f"{EMOJI['check']} <b><u>MTProto API ключи сохранены!</u></b>\n\n"
+            + quote_block(
+                f"<b>API_ID:</b>  <code>{int(raw_id)}</code>\n"
+                f"<b>Статус:</b>  <code>{esc(mt_msg)}</code>"
+            )
+            + extra_hint
+        ),
     )
 
 
@@ -5360,6 +5893,19 @@ async def free_text_check_handler(update: Update, context: ContextTypes.DEFAULT_
     if update.effective_chat and update.effective_chat.type != ChatType.PRIVATE:
         if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL):
             _record_known_chat_id(update.effective_chat.id)
+        if update.effective_chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+            is_cmd, q_id, q_uname, fwd_name, raw_q, val_err = _extract_group_check_command(msg_obj)
+            if is_cmd and update.effective_user:
+                await perform_scam_check_and_reply(
+                    update,
+                    context,
+                    q_id=q_id,
+                    q_uname=q_uname,
+                    fwd_name=fwd_name,
+                    raw_query=raw_q,
+                    validation_error=val_err,
+                    in_group=True,
+                )
         return
     if not update.effective_user:
         return
@@ -5384,6 +5930,20 @@ async def free_text_check_handler(update: Update, context: ContextTypes.DEFAULT_
         await send_main_menu_photo(update.message, user.id)
         return
 
+    # Если в ЛС тоже написали «проверить @username» или «чек @username» - отсекаем префикс команды
+    is_prefix_cmd, g_id, g_uname, g_fname, g_raw, g_err = _extract_group_check_command(msg_obj)
+    if is_prefix_cmd and g_err != "__EMPTY_GROUP_CHECK__":
+        await perform_scam_check_and_reply(
+            update,
+            context,
+            q_id=g_id,
+            q_uname=g_uname,
+            fwd_name=g_fname,
+            raw_query=g_raw,
+            validation_error=g_err,
+        )
+        return
+
     q_id, q_uname, fwd_name, val_err = extract_target_from_message(update.message)
     await perform_scam_check_and_reply(
         update,
@@ -5401,7 +5961,7 @@ async def free_text_check_handler(update: Update, context: ContextTypes.DEFAULT_
 # =====================================================================
 def build_report_preview_text(data: Dict[str, Any]) -> str:
     t_id = data.get("rep_target_id")
-    t_uname = data.get("rep_target_uname", "")
+    t_uname = (data.get("rep_target_uname", "") or "").strip().lstrip("@")
     t_name = data.get("rep_target_name", "")
     desc = data.get("rep_desc", "")
     media_list: List[Dict[str, str]] = data.get("rep_media", [])
@@ -5409,13 +5969,16 @@ def build_report_preview_text(data: Dict[str, Any]) -> str:
     photos_cnt = sum(1 for m in media_list if m.get("type") == "photo")
     videos_cnt = sum(1 for m in media_list if m.get("type") == "video")
 
-    target_line = f"<b>{esc(t_name or f'@{t_uname}' or f'ID {t_id}')}</b>"
-    if t_uname:
-        target_line += f" (<code>@{esc(t_uname)}</code>)"
-    if t_id:
-        target_line += f"\n• <b>ID:</b> <code>{t_id}</code>"
+    uname_html = f"<code>@{esc(t_uname)}</code>" if t_uname else "<i>Не указан</i>"
+    id_html = f"<code>{t_id}</code>" if t_id else "<i>Скрыт</i>"
+    links_html = format_permanent_links_html(t_id, t_uname)
 
-    target_quote = quote_block(f"{EMOJI['search']} <b>Нарушитель:</b>\n{target_line}")
+    target_quote = quote_block(
+        f"{EMOJI['search']} <b>Нарушитель:</b> <b>{esc(t_name or f'@{t_uname}' or f'ID {t_id}')}</b>\n"
+        f"• <b>Юзернейм:</b> {uname_html}\n"
+        f"• <b>Telegram ID:</b> {id_html}\n"
+        f"• <b>Ссылки:</b> {links_html}"
+    )
     desc_quote = quote_block(
         f"{EMOJI['no_entry']} <b>Описание ситуации:</b>\n<i>{esc(clip_text(desc, 1200))}</i>",
         expandable=len(desc) > 220,
@@ -5949,9 +6512,21 @@ async def dispatch_report_to_admin(bot, report_id: int, admin_id: int) -> bool:
         return False
 
     media_items = _parse_media_json(report["media_json"])
+    t_uname_clean = (report["target_username"] or "").strip().lstrip("@")
+    t_uname = f"@{t_uname_clean}" if t_uname_clean else "нет username"
+    t_id_num = report["target_id"] if report["target_id"] else None
+    t_id_disp = str(t_id_num) if t_id_num else "Скрыт (нет диалога с ботом)"
+    t_links_html = format_permanent_links_html(t_id_num, t_uname_clean)
+    t_links_lbl = "Вечные ссылки" if t_id_num else "Ссылки на профиль"
+    rep_uname = f"@{report['reporter_username']}" if report["reporter_username"] else "нет username"
 
-    # 1. Отправляем все доказательства вместе в одном альбоме
-    album_caption = f"{EMOJI['eyes']} <b>Доказательства к заявке #{report_id}</b> (<code>{len(media_items)}</code> файлов)"
+    # 1. Отправляем все доказательства вместе в одном альбоме (с ID, юзернеймом и ссылками)
+    album_caption = (
+        f"{EMOJI['eyes']} <b>Доказательства к заявке #{report_id}</b> (<code>{len(media_items)}</code> файлов)\n"
+        f"<b>Нарушитель:</b> <b>{esc(clip_text(report['target_name'] or t_uname, 50))}</b>\n"
+        f"• Юзернейм: <code>{esc(t_uname)}</code>  •  Telegram ID: <code>{esc(t_id_disp)}</code>\n"
+        f"• {t_links_lbl}: {t_links_html}"
+    )
     sent_msg_ids = await send_media_album_safe(
         bot,
         chat_id=admin_id,
@@ -5960,14 +6535,11 @@ async def dispatch_report_to_admin(bot, report_id: int, admin_id: int) -> bool:
     )
 
     # 2. Отправляем основную карточку заявки с кнопками
-    t_uname = f"@{report['target_username']}" if report["target_username"] else "нет username"
-    t_id = report["target_id"] or "неизвестен"
-    rep_uname = f"@{report['reporter_username']}" if report["reporter_username"] else "нет username"
-
     suspect_quote = quote_block(
         f"{EMOJI['search']} <b>Подозреваемый:</b> <b>{esc(report['target_name'])}</b>\n"
         f"• Юзернейм: <code>{esc(t_uname)}</code>\n"
-        f"• ID: <code>{esc(str(t_id))}</code>"
+        f"• Telegram ID: <code>{esc(t_id_disp)}</code>\n"
+        f"• {t_links_lbl}: {t_links_html}"
     )
     reporter_quote = quote_block(
         f"{EMOJI['crown']} <b>Отправитель жалобы:</b> <b>{esc(report['reporter_name'])}</b>\n"
@@ -6133,11 +6705,18 @@ async def publish_report_proofs_to_channel(
                 if sent_ids:
                     return build_channel_message_link(chan_id, chan_uname, sent_ids[0])
             else:
+                album_proof_cap = (
+                    f"{EMOJI['eyes']} <b>Доказательства по делу #{rec_id}</b> (<code>Заявка #{report_id}</code>)\n"
+                    f"<b>Нарушитель:</b> <b>{esc(clip_text(t_name, 50))}</b>\n"
+                    f"• Юзернеймы: {usernames_html}\n"
+                    f"• Telegram ID: {id_html}\n"
+                    f"• {links_label}: {perm_links_html}"
+                )
                 await send_media_album_safe(
                     bot,
                     chat_id=chan_id,
                     media_items=media_items,
-                    caption_prefix=f"{EMOJI['eyes']} <b>Доказательства по делу #{rec_id}</b> (<code>Заявка #{report_id}</code>)",
+                    caption_prefix=album_proof_cap,
                 )
                 msg = await safe_send_message(bot, chat_id=chan_id, text=post_text, reply_markup=ch_kb)
                 if msg:
@@ -7175,9 +7754,14 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
         )
         return
 
-    if not db_has_accepted_terms(user.id) and not is_mod_or_admin:
+    is_group_public_cb = bool(
+        query.message
+        and getattr(getattr(query.message, "chat", None), "type", None) != ChatType.PRIVATE
+        and data.startswith(("scam_proofs:", "vote:", "no_proof:"))
+    )
+    if not db_has_accepted_terms(user.id) and not is_mod_or_admin and not is_group_public_cb:
         await query.answer("Сначала примите политику и условия пользования!", show_alert=True)
-        if query.message:
+        if query.message and getattr(getattr(query.message, "chat", None), "type", None) == ChatType.PRIVATE:
             await send_welcome_terms_prompt(query.message, user.id, full_mode=False)
         return
 
@@ -7265,7 +7849,21 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
             return
         await query.answer("Отправляю доказательства...")
         if query.message:
-            cap = f"{EMOJI['eyes']} <b>Доказательства по скамеру #{rec_id}</b> (<code>{len(media_items)}</code> файлов)"
+            s_id = row["user_id"]
+            s_un = (row["username"] or "").strip().lstrip("@")
+            s_ex = _parse_extra_usernames(row["extra_usernames"])
+            s_name = row["full_name"] or (f"@{s_un}" if s_un else f"ID {s_id}")
+            s_id_html = f"<code>{s_id}</code>" if s_id else "<i>Скрыт</i>"
+            s_links = format_permanent_links_html(s_id, s_un, s_ex)
+            cap = (
+                f"{EMOJI['eyes']} <b>Доказательства по скамеру #{rec_id}</b> (<code>{len(media_items)}</code> файлов)\n\n"
+                f"• <b>Профиль:</b> <b>{esc(clip_text(s_name, 56))}</b>\n"
+                f"• <b>Юзернеймы:</b> {format_usernames_html(s_un, s_ex)}\n"
+                f"• <b>Telegram ID:</b> {s_id_html}\n"
+                f"• <b>Ссылки:</b> {s_links}\n"
+                f"• <b>Ущерб:</b> <code>{esc(clip_text(row['damage'] or 'Не указан', 60))}</code>\n"
+                f"• <b>Причина:</b> <i>{esc(clip_text(row['reason'] or 'Мошенничество', 160))}</i>"
+            )
             await send_media_album_safe(context.bot, query.message.chat_id, media_items, caption_prefix=cap)
         return
 
@@ -7398,14 +7996,40 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
 
         db_finalize_report(report_id, status="accepted", admin_id=user.id)
 
-        cached = db_get_user_cache(user_id=report["target_id"], username=report["target_username"] or "")
-        cached_extras = _parse_extra_usernames(cached["extra_usernames"]) if cached and cached["extra_usernames"] else []
+        known_acc = db_lookup_known_identity(
+            user_id=report["target_id"],
+            username=report["target_username"] or "",
+        )
+        eff_tid = report["target_id"] or known_acc["user_id"]
+        eff_tun = (report["target_username"] or known_acc["username"] or "").strip().lstrip("@").lower()
+        eff_tname = report["target_name"] or known_acc["full_name"] or (f"@{eff_tun}" if eff_tun else f"ID {eff_tid}")
+        if not eff_tid and eff_tun:
+            try:
+                _, _, mt_id, mt_un, mt_ex, mt_nm, _ = await asyncio.wait_for(
+                    validate_and_resolve_user(context.bot, None, eff_tun, fetch_avatar=False),
+                    timeout=3.5,
+                )
+                if mt_id:
+                    eff_tid = mt_id
+                if mt_un:
+                    eff_tun = mt_un
+                if mt_nm and _is_placeholder_name(eff_tname, eff_tun, eff_tid):
+                    eff_tname = mt_nm
+            except Exception:
+                pass
+
+        cached = db_get_user_cache(user_id=eff_tid, username=eff_tun)
+        cached_extras = _merge_username_aliases(
+            eff_tun,
+            known_acc["extra_usernames"],
+            _parse_extra_usernames(cached["extra_usernames"]) if cached and cached["extra_usernames"] else [],
+        )
         media_items = _parse_media_json(report["media_json"])
 
         rec_id = db_add_or_update_scammer(
-            user_id=report["target_id"],
-            username=report["target_username"] or "",
-            full_name=report["target_name"] or "",
+            user_id=eff_tid,
+            username=eff_tun,
+            full_name=eff_tname,
             reason=report["description"],
             proof=f"Подтверждено по жалобе #{report_id} ({len(media_items)} медиа)" if media_items else f"Подтверждено по жалобе #{report_id}",
             damage="По жалобе",
@@ -7421,19 +8045,26 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
                 delay=0.22,
             )
 
+        report_for_pub = {
+            "target_id": eff_tid,
+            "target_username": eff_tun,
+            "target_name": eff_tname,
+            "description": report["description"],
+            "media_json": report["media_json"],
+        }
         # Публикуем пруфы в настроенный канал и копируем ссылку на сообщение
         channel_post_url = await publish_report_proofs_to_channel(
             context.bot,
             report_id=report_id,
-            report=report,
+            report=report_for_pub,
             rec_id=rec_id,
             extra_usernames=cached_extras,
         )
         if channel_post_url:
             db_add_or_update_scammer(
-                user_id=report["target_id"],
-                username=report["target_username"] or "",
-                full_name=report["target_name"] or "",
+                user_id=eff_tid,
+                username=eff_tun,
+                full_name=eff_tname,
                 reason=report["description"],
                 proof=channel_post_url,
                 damage="По жалобе",
@@ -7549,14 +8180,18 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
         stats = db_get_stats()
         chan_id, chan_uname, chan_title = db_get_proof_channel()
         chan_disp = f"@{chan_uname}" if chan_uname else (chan_title or f"ID {chan_id}" if chan_id else "Не привязан")
+        mt_ok, mt_msg = _is_mtproto_ready()
+        mt_disp = f"Включён ({mt_msg})" if mt_ok else f"Не настроен ({mt_msg}) • /set_api"
         text = (
             f"{EMOJI['gear']} <b><u>АДМИН-ПАНЕЛЬ • {BOT_NAME}</u></b>\n\n"
             + quote_block(
+                f"{EMOJI['crown']} <b>Зашли в бота (/start):</b>  <code>{stats['total_started']}</code>\n"
                 f"{EMOJI['siren']} <b>Скамеров в базе:</b>  <code>{stats['total_scammers']}</code>\n"
-                f"{EMOJI['crown']} <b>Гарантов в базе:</b>  <code>{stats['total_guarantors']}</code>\n"
+                f"{EMOJI['shield']} <b>Гарантов в базе:</b>  <code>{stats['total_guarantors']}</code>\n"
                 f"{EMOJI['shield']} <b>Модераторов заявок:</b>  <code>{stats['total_mods']}</code>\n"
                 f"{EMOJI['clock']} <b>Активных жалоб в очереди:</b>  <code>{stats['pending_reports']}</code>\n"
                 f"{EMOJI['eyes']} <b>Канал пруфов:</b>  <code>{esc(chan_disp)}</code>\n"
+                f"{EMOJI['lock']} <b>Определитель ID (MTProto):</b>  <code>{esc(mt_disp)}</code>\n"
                 f"{EMOJI['search']} <b>Всего проверок 24/7:</b>  <code>{stats['total_checks']}</code>"
             )
             + "\n\n<i>Выберите действие для управления базой:</i>"
@@ -7652,17 +8287,21 @@ async def universal_callback_handler(update: Update, context: ContextTypes.DEFAU
     if data == "admin_stats":
         stats = db_get_stats()
         now_str = datetime.now().strftime("%H:%M:%S")
+        mt_ok, mt_msg = _is_mtproto_ready()
+        mt_disp = f"Активен ({mt_msg})" if mt_ok else f"Не настроен ({mt_msg})"
         text = (
             f"{EMOJI['chart']} <b><u>Статистика {BOT_NAME}</u></b>\n\n"
             + quote_block(
-                f"{EMOJI['siren']} <b>Скамеров в базе:</b>  <code>{stats['total_scammers']}</code>\n"
-                f"{EMOJI['crown']} <b>Гарантов в базе:</b>  <code>{stats['total_guarantors']}</code>\n"
-                f"{EMOJI['shield']} <b>Модераторов заявок:</b>  <code>{stats['total_mods']}</code>\n"
-                f"{EMOJI['clock']} <b>Активных жалоб:</b>  <code>{stats['pending_reports']}</code>\n"
+                f"{EMOJI['crown']} <b>Зашли в бота (/start):</b>  <code>{stats['total_started']}</code>\n"
+                f"{EMOJI['check']} <b>Приняли правила:</b>  <code>{stats['total_agreed']}</code>\n"
                 f"{EMOJI['search']} <b>Всего проверок 24/7:</b>  <code>{stats['total_checks']}</code>\n"
                 f"{EMOJI['no_entry']} <b>Выявлено скамеров:</b>  <code>{stats['scammer_hits']}</code>\n"
+                f"{EMOJI['siren']} <b>Скамеров в базе:</b>  <code>{stats['total_scammers']}</code>\n"
+                f"{EMOJI['shield']} <b>Гарантов в базе:</b>  <code>{stats['total_guarantors']}</code>\n"
+                f"{EMOJI['shield']} <b>Модераторов заявок:</b>  <code>{stats['total_mods']}</code>\n"
+                f"{EMOJI['clock']} <b>Активных жалоб:</b>  <code>{stats['pending_reports']}</code>\n"
                 f"{EMOJI['fire']} <b>Оценок поставлено:</b>  <code>{stats['total_votes']}</code>\n"
-                f"{EMOJI['check']} <b>Приняли правила:</b>  <code>{stats['total_agreed']}</code>\n"
+                f"{EMOJI['lock']} <b>MTProto ID:</b>  <code>{esc(mt_disp)}</code>\n"
                 f"{EMOJI['clock']} <b>Аптайм:</b>  <code>{get_uptime()}</code>"
             )
             + f"\n\n<i>Обновлено в</i> <code>{now_str}</code>"
@@ -8102,10 +8741,11 @@ def main() -> None:
     # 3. Автоматическое определение канала пруфов при выдаче админки боту
     application.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
 
-    # 4. Команды /start, /menu, /check и /profile для всех пользователей
+    # 4. Команды /start, /menu, /check, /profile и админская настройка MTProto /set_api
     application.add_handler(CommandHandler(["start", "menu"], start_or_menu_handler))
     application.add_handler(CommandHandler("check", check_command_handler))
     application.add_handler(CommandHandler(["profile", "me"], profile_command_handler))
+    application.add_handler(CommandHandler("set_api", set_api_command_handler))
 
     # 5. Все inline-кнопки меню, профилей, жалоб и админ-панели
     application.add_handler(CallbackQueryHandler(universal_callback_handler))
